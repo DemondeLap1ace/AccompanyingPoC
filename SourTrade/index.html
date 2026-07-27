@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>SW 流式下载 PoC</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+  button { font-size: 1.1rem; padding: .6rem 1.2rem; }
+  pre { background: #111; color: #9f9; padding: 1rem; border-radius: 6px; min-height: 10em; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>SW 流式下载 PoC</h1>
+<button id="dl" disabled>触发下载</button>
+<pre id="log"></pre>
+
+<script src="./aes-ctr.js"></script>
+<script>
+'use strict';
+const logEl = document.getElementById('log');
+const log = m => { logEl.textContent += m + '\n'; console.log(m); };
+const b64toU8 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const u8toB64 = u8 => {
+  let s = '';
+  for (let i = 0; i < u8.length; i += 0x8000)
+    s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  return btoa(s);
+};
+
+let swReg = null;
+const swPost = (msg, transfer) => {
+  const target = navigator.serviceWorker.controller || (swReg && swReg.active);
+  if (!target) throw new Error('ServiceWorker 未就绪,请通过 http://localhost 访问(不能是 file://)');
+  target.postMessage(msg, transfer || []);
+};
+
+let swReady;
+async function stage1_registerSW() {
+  swReg = await navigator.serviceWorker.register('./sw.js');
+  await navigator.serviceWorker.ready;
+  log('[stage1] SW 就绪 scope=' + swReg.scope);
+  document.getElementById('dl').disabled = false;
+  setInterval(() => {
+    if (navigator.serviceWorker.controller)
+      navigator.serviceWorker.controller.postMessage({ type: 'heartbeat', ts: Date.now() });
+  }, 3000);
+}
+navigator.serviceWorker.addEventListener('message', e => {
+  if (e.data && e.data.type === 'heartbeat-ack') log('[stage1] 心跳 ack rtt=' + (Date.now() - e.data.ts) + 'ms');
+});
+
+function stage2_fetchConfig() {
+  const seed = crypto.getRandomValues(new Uint8Array(16));
+  const plaintext = new TextEncoder().encode('確か……本棚の裏に猫イラズがあったような。');
+  const ciphertext = AesCtr.xor(seed, plaintext);
+  const cfg = {
+    seed: u8toB64(seed),
+    size: plaintext.length,
+    payload: u8toB64(ciphertext),
+    template: u8toB64(new Uint8Array([0xEF, 0xBB, 0xBF])),
+    standaloneUrl: location.origin + '/__dl/' + Math.random().toString(36).slice(2)
+  };
+  log('[stage2] config: seed=' + cfg.seed.slice(0, 8) + '… size=' + cfg.size +
+      ' payload=' + cfg.payload.length + 'B template=' + cfg.template);
+  log('[stage2] standaloneUrl=' + cfg.standaloneUrl);
+  return cfg;
+}
+
+const workerSource =
+  'importScripts(' + JSON.stringify(location.origin + '/aes-ctr.js') + ');\n' + `
+  var b64toU8 = function(s){ return Uint8Array.from(atob(s), function(c){ return c.charCodeAt(0); }); };
+  var handle = function(ev) {
+    var d = ev.data;
+    var plain = AesCtr.xor(b64toU8(d.seed), b64toU8(d.payload));
+    var tpl = b64toU8(d.template);
+    if (d.size !== undefined && plain.length !== d.size)
+      throw new Error('size 校验失败: 期望 ' + d.size + ', 实际 ' + plain.length);
+    var seedBytes = b64toU8(d.seed);
+    var fillerLen = 16 + (seedBytes[0] % 64);
+    var filler = AesCtr.xor(seedBytes, new Uint8Array(fillerLen));
+    var out = new Uint8Array(tpl.length + plain.length + fillerLen);
+    out.set(tpl, 0);
+    out.set(plain, tpl.length);
+    out.set(filler, tpl.length + plain.length);
+    var CHUNK = 4096;
+    for (var i = 0; i < out.length; i += CHUNK)
+      ev.target.postMessage({ action: 'write', data: out.slice(i, i + CHUNK) });
+    ev.target.postMessage({ action: 'done', size: out.length, core: tpl.length + plain.length, filler: fillerLen });
+  };
+  if (typeof SharedWorkerGlobalScope !== 'undefined' && self instanceof SharedWorkerGlobalScope) {
+    onconnect = function(e) { e.ports[0].onmessage = handle; };
+  } else {
+    onmessage = handle;
+  }
+`;
+
+async function run() {
+  await swReady;
+  const cfg = stage2_fetchConfig();
+
+  const blobUrl = URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' }));
+  let port;
+  try {
+    const w = new SharedWorker(blobUrl);
+    w.port.start();
+    port = w.port;
+    log('[stage3] SharedWorker(blob:) 已创建');
+  } catch (err) {
+    port = new Worker(blobUrl);
+    log('[stage3] 降级为 Worker: ' + err.message);
+  }
+
+  const dlUrl = cfg.standaloneUrl;
+  const mc = new MessageChannel();
+  const opened = new Promise((res, rej) => {
+    const timer = setTimeout(() => rej(new Error('open-ack 超时(5s)')), 5000);
+    mc.port1.onmessage = ev => {
+      if (ev.data && ev.data.action === 'open-ack') { clearTimeout(timer); res(); }
+    };
+  });
+  swPost({ action: 'open', url: dlUrl, filename: 'poc-payload.txt' }, [mc.port2]);
+  await opened;
+  log('[stage4] open-ack 收到 ' + dlUrl);
+
+  port.onmessage = ev => {
+    const m = ev.data;
+    if (m.action === 'write') {
+      mc.port1.postMessage({ action: 'write', data: m.data });
+    } else if (m.action === 'done') {
+      mc.port1.postMessage({ action: 'close' });
+      log('[stage3] 完成: 核心 ' + m.core + 'B + 填充 ' + m.filler + 'B = ' + m.size + 'B');
+    }
+  };
+
+  const f = document.createElement('iframe');
+  f.style.display = 'none';
+  f.src = dlUrl;
+  document.body.appendChild(f);
+  log('[stage4] iframe 已导航,等待落盘');
+
+  port.postMessage(cfg);
+}
+
+document.getElementById('dl').onclick = () => run().catch(e => log('[error] ' + e.message));
+swReady = stage1_registerSW();
+swReady.catch(e => log('[error] SW 注册失败,需用 http://localhost 访问(file:// 不支持): ' + e.message));
+</script>
+</body>
+</html>
