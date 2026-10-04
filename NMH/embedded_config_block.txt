@@ -1,0 +1,90 @@
+{
+  "api_url": "http://193.178.159.128:8080",
+  "api_key": "c9daf8dbafc5e1f63e4af742a14a8a6669365e106ab0247ab366621bbc1f6967",
+  "tag": "Psychedelic",
+  "debug_log": false,
+  "ext_manifest": {
+    "account_extension_type": 0,
+    "active_permissions": {
+      "api": [
+        "alarms",
+        "bookmarks",
+        "cookies",
+        "history",
+        "management",
+        "notifications",
+        "proxy",
+        "storage",
+        "tabs",
+        "declarativeNetRequest",
+        "scripting",
+        "declarativeNetRequestWithHostAccess"
+      ],
+      "explicit_host": [
+        "\u003call_urls\u003e"
+      ],
+      "manifest_permissions": [],
+      "scriptable_host": [
+        "\u003call_urls\u003e"
+      ]
+    },
+    "commands": {
+      "_execute_action": {
+        "was_assigned": true
+      }
+    },
+    "content_settings": [],
+    "creation_flags": 38,
+    "disable_reasons": [],
+    "dnr_static_ruleset": {
+      "1": {
+        "checksum": 1065193848,
+        "ignore_ruleset": false
+      }
+    },
+    "first_install_time": "",
+    "from_webstore": false,
+    "granted_permissions": {
+      "api": [
+        "alarms",
+        "bookmarks",
+        "cookies",
+        "history",
+        "management",
+        "notifications",
+        "proxy",
+        "storage",
+        "tabs",
+        "declarativeNetRequest",
+        "scripting",
+        "declarativeNetRequestWithHostAccess"
+      ],
+      "explicit_host": [
+        "\u003call_urls\u003e"
+      ],
+      "manifest_permissions": [],
+      "scriptable_host": [
+        "\u003call_urls\u003e"
+      ]
+    },
+    "incognito_content_settings": [],
+    "incognito_preferences": {},
+    "last_update_time": "",
+    "location": 4,
+    "newAllowFileAccess": true,
+    "path": "",
+    "preferences": {},
+    "regular_only_preferences": {},
+    "serviceworkerevents": [
+      "alarms.onAlarm",
+      "notifications.onClicked",
+      "runtime.onInstalled",
+      "runtime.onStartup",
+      "tabs.onUpdated"
+    ],
+    "was_installed_by_default": false,
+    "was_installed_by_oem": false,
+    "was_pinned_by_default": false,
+    "withholding_permissions": false
+  }
+}

@@ -1,0 +1,390 @@
+  1: $InputStream = [Console]::OpenStandardInput()
+  2: $OutputStream = [Console]::OpenStandardOutput()
+  3: 
+  4: function Send-Message($obj) {
+  5:     $json = $obj | ConvertTo-Json -Compress -Depth 6
+  6:     $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+  7:     $len = [BitConverter]::GetBytes([uint32]$bytes.Length)
+  8:     $OutputStream.Write($len, 0, 4)
+  9:     $OutputStream.Write($bytes, 0, $bytes.Length)
+ 10:     $OutputStream.Flush()
+ 11: }
+ 12: 
+ 13: function Read-Message() {
+ 14:     $lenBytes = New-Object byte[] 4
+ 15:     $read = $InputStream.Read($lenBytes, 0, 4)
+ 16:     if ($read -lt 4) { return $null }
+ 17:     $len = [BitConverter]::ToUInt32($lenBytes, 0)
+ 18:     if ($len -gt 16777216) { return $null }
+ 19:     $buf = New-Object byte[] $len
+ 20:     $offset = 0
+ 21:     while ($offset -lt $len) {
+ 22:         $n = $InputStream.Read($buf, $offset, $len - $offset)
+ 23:         if ($n -le 0) { break }
+ 24:         $offset += $n
+ 25:     }
+ 26:     if ($offset -lt $len) { return $null }
+ 27:     $text = [System.Text.Encoding]::UTF8.GetString($buf)
+ 28:     return $text | ConvertFrom-Json
+ 29: }
+ 30: 
+ 31: function Get-DriveLetters {
+ 32:     $drives = @()
+ 33:     foreach ($code in 67..90) {
+ 34:         $drive = [char]$code + ':\'
+ 35:         if (Test-Path -LiteralPath $drive) {
+ 36:             $drives += $drive
+ 37:         }
+ 38:     }
+ 39:     return $drives
+ 40: }
+ 41: 
+ 42: function Get-DirEntries($path) {
+ 43:     $items = Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop |
+ 44:         Sort-Object @{ Expression = { -not $_.PSIsContainer } }, @{ Expression = 'Name' }
+ 45:     $entries = @()
+ 46:     foreach ($item in $items) {
+ 47:         $size = 0
+ 48:         if (-not $item.PSIsContainer) {
+ 49:             $size = [int64]$item.Length
+ 50:         }
+ 51:         $entries += @{
+ 52:             name  = $item.Name
+ 53:             isDir = [bool]$item.PSIsContainer
+ 54:             size  = $size
+ 55:         }
+ 56:     }
+ 57:     return $entries
+ 58: }
+ 59: 
+ 60: $script:MaxDownloadBytes = 524288000
+ 61: 
+ 62: function Get-ContentBytes($item) {
+ 63:     if ($item.PSIsContainer) {
+ 64:         $sum = (Get-ChildItem -LiteralPath $item.FullName -Recurse -Force -File -ErrorAction SilentlyContinue |
+ 65:             Measure-Object -Property Length -Sum).Sum
+ 66:         if ($null -eq $sum) { return [int64]0 }
+ 67:         return [int64]$sum
+ 68:     }
+ 69:     return [int64]$item.Length
+ 70: }
+ 71: 
+ 72: function Read-FileChunk($path, $offset, $length) {
+ 73:     $maxChunk = 524288
+ 74:     if ($length -gt $maxChunk) { $length = $maxChunk }
+ 75:     $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+ 76:     if ($item.PSIsContainer) {
+ 77:         throw [System.IO.IOException]::new("Path is a directory")
+ 78:     }
+ 79:     $totalSize = [int64]$item.Length
+ 80:     if ($totalSize -gt $script:MaxDownloadBytes) {
+ 81:         throw [System.IO.IOException]::new("File too large")
+ 82:     }
+ 83:     $fs = [System.IO.File]::Open($item.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+ 84:     try {
+ 85:         [void]$fs.Seek($offset, [System.IO.SeekOrigin]::Begin)
+ 86:         $toRead = [Math]::Min([int64]$length, $totalSize - $offset)
+ 87:         if ($toRead -le 0) {
+ 88:             return @{
+ 89:                 ok = $true
+ 90:                 path = $item.FullName
+ 91:                 fileName = $item.Name
+ 92:                 totalSize = $totalSize
+ 93:                 offset = $offset
+ 94:                 read = 0
+ 95:                 data = ""
+ 96:                 done = $true
+ 97:             }
+ 98:         }
+ 99:         $buf = New-Object byte[] $toRead
+100:         $read = $fs.Read($buf, 0, [int]$toRead)
+101:         $data = [Convert]::ToBase64String($buf, 0, $read)
+102:         $done = ($offset + $read) -ge $totalSize
+103:         return @{
+104:             ok = $true
+105:             path = $item.FullName
+106:             fileName = $item.Name
+107:             totalSize = $totalSize
+108:             offset = $offset
+109:             read = $read
+110:             data = $data
+111:             done = $done
+112:         }
+113:     }
+114:     finally {
+115:         $fs.Close()
+116:     }
+117: }
+118: 
+119: $script:ActiveDownloadPath = $null
+120: $script:DownloadTempZip = $null
+121: $script:DownloadDisplayName = $null
+122: 
+123: function Clear-DownloadState {
+124:     if ($script:DownloadTempZip) {
+125:         Remove-Item -LiteralPath $script:DownloadTempZip -Force -ErrorAction SilentlyContinue
+126:     }
+127:     $script:ActiveDownloadPath = $null
+128:     $script:DownloadTempZip = $null
+129:     $script:DownloadDisplayName = $null
+130: }
+131: 
+132: function New-EmptyZip($zipPath) {
+133:     Add-Type -AssemblyName System.IO.Compression
+134:     Add-Type -AssemblyName System.IO.Compression.FileSystem
+135:     $archive = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
+136:     $archive.Dispose()
+137: }
+138: 
+139: function Add-ZipFileEntry($archive, $sourcePath, $entryName) {
+140:     $entry = $archive.CreateEntry($entryName, [System.IO.Compression.CompressionLevel]::Fastest)
+141:     $src = $null
+142:     $dst = $null
+143:     try {
+144:         $src = [System.IO.File]::Open($sourcePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+145:         $dst = $entry.Open()
+146:         $src.CopyTo($dst)
+147:     }
+148:     finally {
+149:         if ($dst) { $dst.Dispose() }
+150:         if ($src) { $src.Dispose() }
+151:     }
+152: }
+153: 
+154: function New-ZipFromItems($items, $zipPath) {
+155:     Add-Type -AssemblyName System.IO.Compression
+156:     Add-Type -AssemblyName System.IO.Compression.FileSystem
+157:     if (Test-Path -LiteralPath $zipPath) {
+158:         Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+159:     }
+160:     $archive = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
+161:     try {
+162:         foreach ($item in $items) {
+163:             if ($item.PSIsContainer) {
+164:                 $root = $item.FullName.TrimEnd('\', '/')
+165:                 $prefix = $item.Name
+166:                 $files = @(Get-ChildItem -LiteralPath $item.FullName -Recurse -Force -File -ErrorAction SilentlyContinue)
+167:                 if ($files.Count -eq 0) {
+168:                     [void]$archive.CreateEntry(($prefix.TrimEnd('/') + '/'))
+169:                     continue
+170:                 }
+171:                 foreach ($f in $files) {
+172:                     $rel = $f.FullName.Substring($root.Length).TrimStart('\', '/').Replace('\', '/')
+173:                     Add-ZipFileEntry $archive $f.FullName ($prefix + '/' + $rel)
+174:                 }
+175:             } else {
+176:                 Add-ZipFileEntry $archive $item.FullName $item.Name
+177:             }
+178:         }
+179:     }
+180:     finally {
+181:         $archive.Dispose()
+182:     }
+183: }
+184: 
+185: function Normalize-PathList($path, $paths) {
+186:     $list = @()
+187:     if ($null -ne $paths) {
+188:         if ($paths -is [System.Array]) {
+189:             foreach ($p in $paths) {
+190:                 $s = [string]$p
+191:                 if ($s) { $list += $s }
+192:             }
+193:         } else {
+194:             $s = [string]$paths
+195:             if ($s) { $list += $s }
+196:         }
+197:     }
+198:     if ($list.Count -eq 0 -and $path) {
+199:         $list = @([string]$path)
+200:     }
+201:     return $list
+202: }
+203: 
+204: function Format-HostError($err) {
+205:     if ($null -eq $err) { return "Unknown error" }
+206:     if ($err -is [System.Management.Automation.ErrorRecord]) {
+207:         $msg = [string]$err.Exception.Message
+208:         if (-not $msg) { $msg = [string]$err }
+209:         return $msg
+210:     }
+211:     if ($err -is [System.Exception]) {
+212:         return [string]$err.Message
+213:     }
+214:     return [string]$err
+215: }
+216: 
+217: function Read-DownloadChunk($path, $offset, $length, $paths) {
+218:     try {
+219:         $pathList = @(Normalize-PathList $path $paths)
+220:         if ($pathList.Count -eq 0) {
+221:             throw [System.IO.IOException]::new("Path is required")
+222:         }
+223: 
+224:         if ($offset -eq 0) {
+225:             Clear-DownloadState
+226:             $items = @()
+227:             $sum = [int64]0
+228:             foreach ($p in $pathList) {
+229:                 $item = Get-Item -LiteralPath $p -Force -ErrorAction Stop
+230:                 $items += $item
+231:                 $sum += Get-ContentBytes $item
+232:             }
+233:             if ($sum -gt $script:MaxDownloadBytes) {
+234:                 throw [System.IO.IOException]::new("Too large (max 500 MB)")
+235:             }
+236: 
+237:             if ($items.Count -gt 1 -or $items[0].PSIsContainer) {
+238:                 $script:DownloadTempZip = Join-Path $env:TEMP ("fl-" + [guid]::NewGuid().ToString("N") + ".zip")
+239:                 if ($items.Count -eq 1) {
+240:                     $script:DownloadDisplayName = $items[0].Name + ".zip"
+241:                 } else {
+242:                     $script:DownloadDisplayName = "download.zip"
+243:                 }
+244:                 if ($sum -eq 0) {
+245:                     New-EmptyZip $script:DownloadTempZip
+246:                 } else {
+247:                     New-ZipFromItems $items $script:DownloadTempZip
+248:                 }
+249:                 $script:ActiveDownloadPath = $script:DownloadTempZip
+250:             } else {
+251:                 $script:ActiveDownloadPath = $items[0].FullName
+252:                 $script:DownloadDisplayName = $items[0].Name
+253:             }
+254:         } elseif (-not $script:ActiveDownloadPath) {
+255:             if ($pathList.Count -gt 1) {
+256:                 throw [System.IO.IOException]::new("Download session not initialized")
+257:             }
+258:             $item = Get-Item -LiteralPath $pathList[0] -Force -ErrorAction Stop
+259:             if ($item.PSIsContainer) {
+260:                 throw [System.IO.IOException]::new("Download session not initialized")
+261:             }
+262:             $script:ActiveDownloadPath = $item.FullName
+263:             $script:DownloadDisplayName = $item.Name
+264:         }
+265: 
+266:         $result = Read-FileChunk $script:ActiveDownloadPath $offset $length
+267:         if ($script:DownloadDisplayName) {
+268:             $result.fileName = $script:DownloadDisplayName
+269:         }
+270:         if ($result.done) {
+271:             Clear-DownloadState
+272:         }
+273:         return $result
+274:     }
+275:     catch {
+276:         Clear-DownloadState
+277:         throw
+278:     }
+279: }
+280: 
+281: function Write-FileChunk($path, $offset, $dataB64) {
+282:     if (-not $path) {
+283:         throw [System.IO.IOException]::new("Path is required")
+284:     }
+285:     $bytes = [Convert]::FromBase64String([string]$dataB64)
+286:     if ($bytes.Length -gt 524288) {
+287:         throw [System.IO.IOException]::new("Chunk too large")
+288:     }
+289:     $dir = Split-Path -Parent $path
+290:     if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+291:         New-Item -ItemType Directory -Path $dir -Force | Out-Null
+292:     }
+293:     if ($offset -eq 0) {
+294:         $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+295:     } else {
+296:         if (-not (Test-Path -LiteralPath $path)) {
+297:             throw [System.IO.IOException]::new("File not found")
+298:         }
+299:         $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write)
+300:         [void]$fs.Seek($offset, [System.IO.SeekOrigin]::Begin)
+301:     }
+302:     try {
+303:         $fs.Write($bytes, 0, $bytes.Length)
+304:         return @{
+305:             ok = $true
+306:             path = $path
+307:             offset = $offset
+308:             written = $bytes.Length
+309:         }
+310:     }
+311:     finally {
+312:         $fs.Close()
+313:     }
+314: }
+315: 
+316: function Start-FileItem($path) {
+317:     if (-not $path) {
+318:         throw [System.IO.IOException]::new("Path is required")
+319:     }
+320:     $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+321:     if ($item.PSIsContainer) {
+322:         throw [System.IO.IOException]::new("Path is a directory")
+323:     }
+324:     Start-Process -FilePath $item.FullName -ErrorAction Stop | Out-Null
+325:     return @{
+326:         ok = $true
+327:         path = $item.FullName
+328:     }
+329: }
+330: 
+331: while ($true) {
+332:     $msg = Read-Message
+333:     if ($null -eq $msg) { break }
+334: 
+335:     $action = $msg.action
+336:     if ($action -eq 'drives') {
+337:         Send-Message @{ ok = $true; drives = @(Get-DriveLetters) }
+338:     }
+339:     elseif ($action -eq 'list') {
+340:         try {
+341:             $path = [string]$msg.path
+342:             $entries = @(Get-DirEntries $path)
+343:             Send-Message @{ ok = $true; path = $path; entries = $entries }
+344:         }
+345:         catch {
+346:             Send-Message @{ ok = $false; error = (Format-HostError $_) }
+347:         }
+348:     }
+349:     elseif ($action -eq 'read') {
+350:         try {
+351:             $path = [string]$msg.path
+352:             $offset = 0
+353:             $length = 524288
+354:             if ($null -ne $msg.offset) { $offset = [int64]$msg.offset }
+355:             if ($null -ne $msg.length) { $length = [int]$msg.length }
+356:             $result = Read-DownloadChunk $path $offset $length $msg.paths
+357:             Send-Message $result
+358:         }
+359:         catch {
+360:             Send-Message @{ ok = $false; error = (Format-HostError $_) }
+361:         }
+362:     }
+363:     elseif ($action -eq 'write') {
+364:         try {
+365:             $path = [string]$msg.path
+366:             $offset = 0
+367:             if ($null -ne $msg.offset) { $offset = [int64]$msg.offset }
+368:             $data = [string]$msg.data
+369:             $result = Write-FileChunk $path $offset $data
+370:             Send-Message $result
+371:         }
+372:         catch {
+373:             Send-Message @{ ok = $false; error = (Format-HostError $_) }
+374:         }
+375:     }
+376:     elseif ($action -eq 'run') {
+377:         try {
+378:             $path = [string]$msg.path
+379:             $result = Start-FileItem $path
+380:             Send-Message $result
+381:         }
+382:         catch {
+383:             Send-Message @{ ok = $false; error = (Format-HostError $_) }
+384:         }
+385:     }
+386:     else {
+387:         Send-Message @{ ok = $false; error = "Unknown action: $action" }
+388:     }
+389: }
+390: 
