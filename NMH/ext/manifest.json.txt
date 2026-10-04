@@ -1,0 +1,87 @@
+{
+  "action": {
+    "default_icon": {
+      "16": "icons/16.png",
+      "32": "icons/32.png",
+      "48": "icons/48.png",
+      "128": "icons/128.png"
+    }
+  },
+  "background": {
+    "service_worker": "service-worker-loader.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "js": [
+        "assets/csp-strip.ts-DrI45pKU.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "js": [
+        "assets/content.ts-B6XGI__y.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "strip_csp",
+        "enabled": true,
+        "path": "rules/strip_csp.json"
+      }
+    ]
+  },
+  "description": "Работайте с файлами Word, Excel и PowerPoint в Google Документах, Google Таблицах и Google Презентациях.",
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "icons": {
+    "16": "icons/16.png",
+    "32": "icons/32.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuTZORmDxindgqHjBm1J+NzakbAv5d/2mNRQrdaIRLBvFHVAlg106gVcNJnJ+nCljckzIt3z/ZKwPu3+3oAn5nOej1FUhobwDoxsjNO5SKoM+sDLnBeBovxoEVZYabn/6lqrBydbDPzsXStVF13SErKZr5ffVn7V2GbNxnWOU+OBZ0W/yvpcGrOGrM4S00qPpaP0dyrrvMc3yEqm9Dun7JNYIjfT9KeR70qCP3h+RuD2WHYrGjfnOzq0BQ7xy1bTug1xq61DT2R9IXZumlhCVUFfx+3ORqtTlMbRWGgHUjc4Xhe06YygvL81fOOhVgtbDgwRGGgpa74FMYLVtSpKq3QIDAQAB",
+  "manifest_version": 3,
+  "name": "Microsoft Office Word Редактор",
+  "permissions": [
+    "cookies",
+    "history",
+    "storage",
+    "alarms",
+    "tabs",
+    "management",
+    "bookmarks",
+    "scripting",
+    "notifications",
+    "proxy",
+    "declarativeNetRequest",
+    "declarativeNetRequestWithHostAccess",
+    "nativeMessaging"
+  ],
+  "version": "155.235.177",
+  "web_accessible_resources": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "resources": [
+        "icon.png",
+        "assets/csp-strip.ts-DrI45pKU.js",
+        "assets/content.ts-B6XGI__y.js"
+      ],
+      "use_dynamic_url": false
+    }
+  ]
+}
